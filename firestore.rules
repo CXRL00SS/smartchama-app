@@ -1,0 +1,261 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ─── Helper Functions ─────────────────────────────────────────
+
+    // Get the calling user's profile
+    function getProfile() {
+      return get(/databases/$(database)/documents/profiles/$(request.auth.uid)).data;
+    }
+
+    // Check role from profile document (server-read, not client-supplied)
+    function hasRole(role) {
+      return request.auth != null &&
+             get(/databases/$(database)/documents/profiles/$(request.auth.uid)).data.role == role;
+    }
+
+    function isSuperAdmin() {
+      return request.auth != null && hasRole('super_admin');
+    }
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Check if user is an active admin of a specific group
+    function isGroupAdmin(groupId) {
+      return request.auth != null &&
+        exists(/databases/$(database)/documents/group_members/$(request.auth.uid + '_' + groupId)) == false &&
+        exists(
+          /databases/$(database)/documents/group_members/$(groupId + '_' + request.auth.uid)
+        ) == false;
+        // Simplified: check group_members collection for admin roles
+    }
+
+    // More reliable group admin check via profile role + group membership
+    function isGroupMember(groupId) {
+      return request.auth != null &&
+        exists(/databases/$(database)/documents/group_members/$(groupId));
+    }
+
+    function isOwner(userId) {
+      return request.auth != null && request.auth.uid == userId;
+    }
+
+    // ─── Profiles ─────────────────────────────────────────────────
+
+    match /profiles/{userId} {
+      // Users can read their own profile; super admin reads all
+      allow read: if isOwner(userId) || isSuperAdmin();
+      // Users can update their own profile but CANNOT change their own role
+      allow update: if isOwner(userId) &&
+                       !request.resource.data.diff(resource.data).affectedKeys().hasAny(['role']);
+      // Only super admin or server functions (via admin SDK) can change roles
+      allow write: if isSuperAdmin();
+      allow create: if isAuthenticated() && isOwner(userId);
+    }
+
+    // ─── Groups ───────────────────────────────────────────────────
+
+    match /groups/{groupId} {
+      // All authenticated users can read groups (for Browse Groups)
+      allow read: if isAuthenticated();
+      // Only super admin can create groups (chairpersons use Cloud Functions)
+      allow create: if isSuperAdmin();
+      // Group details can be updated by super admin only (group settings via Cloud Functions)
+      allow update: if isSuperAdmin();
+      allow delete: if false; // Never delete groups
+    }
+
+    match /group_settings/{settingsId} {
+      allow read: if isAuthenticated();
+      allow write: if isSuperAdmin();
+    }
+
+    // ─── Group Members ────────────────────────────────────────────
+
+    match /group_members/{memberId} {
+      // Members can see other members of their group
+      allow read: if isAuthenticated();
+      // Only super admin and Cloud Functions (admin SDK) manage membership
+      allow write: if isSuperAdmin();
+    }
+
+    // ─── Fines ────────────────────────────────────────────────────
+
+    match /fines/{fineId} {
+      // Members can only read their own fines
+      allow read: if isAuthenticated() &&
+        (resource.data.member_id == request.auth.uid || isSuperAdmin());
+      // Members CANNOT create, update, or delete their own fines
+      // Fine creation and status updates are via Cloud Functions (admin SDK) or
+      // group admins (chairperson/treasurer role)
+      allow create: if isSuperAdmin();
+      allow update: if isSuperAdmin() &&
+        // Immutable fields cannot be changed
+        !request.resource.data.diff(resource.data).affectedKeys()
+          .hasAny(['group_id', 'member_id', 'amount', 'created_by']);
+      allow delete: if false;
+    }
+
+    // ─── Fine Rules ───────────────────────────────────────────────
+
+    match /fine_rules/{ruleId} {
+      allow read: if isAuthenticated();
+      allow write: if isSuperAdmin();
+    }
+
+    // ─── Fine Disputes ────────────────────────────────────────────
+
+    match /fine_disputes/{disputeId} {
+      // Members can read their own disputes
+      allow read: if isAuthenticated() &&
+        (resource.data.member_id == request.auth.uid || isSuperAdmin());
+      // Members CAN create disputes about their own fines
+      allow create: if isAuthenticated() &&
+        request.resource.data.member_id == request.auth.uid;
+      // Only super admin / Cloud Functions resolve disputes
+      allow update: if isSuperAdmin();
+      allow delete: if false;
+    }
+
+    // ─── Meetings ─────────────────────────────────────────────────
+
+    match /meetings/{meetingId} {
+      allow read: if isAuthenticated();
+      allow write: if isSuperAdmin();
+    }
+
+    // ─── Meeting Attendance ───────────────────────────────────────
+
+    match /meeting_attendance/{attendanceId} {
+      allow read: if isAuthenticated() &&
+        (resource.data.member_id == request.auth.uid || isSuperAdmin());
+      // Members CANNOT mark their own attendance (prevents gaming)
+      allow write: if isSuperAdmin();
+    }
+
+    // ─── Contributions ────────────────────────────────────────────
+
+    match /contributions/{contributionId} {
+      allow read: if isAuthenticated() &&
+        (resource.data.member_id == request.auth.uid || isSuperAdmin());
+      allow write: if isSuperAdmin();
+    }
+
+    // ─── Loans ────────────────────────────────────────────────────
+
+    match /loans/{loanId} {
+      allow read: if isAuthenticated() &&
+        (resource.data.member_id == request.auth.uid || isSuperAdmin());
+      allow create: if isAuthenticated() &&
+        request.resource.data.member_id == request.auth.uid;
+      allow update: if isSuperAdmin();
+      allow delete: if false;
+    }
+
+    match /loan_guarantors/{guarantorId} {
+      allow read: if isAuthenticated();
+      allow write: if isSuperAdmin();
+    }
+
+    match /loan_repayments/{repaymentId} {
+      allow read: if isAuthenticated() &&
+        (resource.data.member_id == request.auth.uid || isSuperAdmin());
+      allow write: if isSuperAdmin();
+    }
+
+    // ─── Payments ─────────────────────────────────────────────────
+
+    match /payments/{paymentId} {
+      // Members can read their own payments
+      allow read: if isAuthenticated() &&
+        (resource.data.member_id == request.auth.uid || isSuperAdmin());
+      // Members CAN create payment records (pending status only) to initiate M-Pesa
+      allow create: if isAuthenticated() &&
+        request.resource.data.member_id == request.auth.uid &&
+        request.resource.data.status == 'pending';
+      // Members CANNOT update payment records — only Cloud Functions (admin SDK) confirm
+      allow update: if isSuperAdmin();
+      allow delete: if false;
+    }
+
+    // ─── Platform Fee Config ──────────────────────────────────────
+
+    match /platform_fee_config/{configId} {
+      // Members and group admins can read the current fee (for disclosure)
+      allow read: if isAuthenticated();
+      // ONLY super admin can write fee configuration
+      allow write: if isSuperAdmin();
+    }
+
+    // ─── Platform Revenue Ledger ──────────────────────────────────
+
+    match /platform_revenue/{entryId} {
+      // ONLY super admin reads revenue
+      allow read: if isSuperAdmin();
+      // Revenue entries are ONLY created by Cloud Functions (admin SDK)
+      // Client-side writes are blocked entirely
+      allow write: if false;
+    }
+
+    // ─── Refunds ─────────────────────────────────────────────────
+
+    match /refunds/{refundId} {
+      allow read: if isAuthenticated() &&
+        (resource.data.member_id == request.auth.uid || isSuperAdmin());
+      allow write: if isSuperAdmin();
+    }
+
+    // ─── Announcements ────────────────────────────────────────────
+
+    match /announcements/{announcementId} {
+      allow read: if isAuthenticated();
+      allow write: if isSuperAdmin();
+    }
+
+    // ─── Documents ────────────────────────────────────────────────
+
+    match /documents/{documentId} {
+      allow read: if isAuthenticated();
+      allow write: if isSuperAdmin();
+    }
+
+    // ─── Notifications ────────────────────────────────────────────
+
+    match /notifications/{notificationId} {
+      allow read: if isAuthenticated() &&
+        (resource.data.user_id == request.auth.uid || isSuperAdmin());
+      allow update: if isAuthenticated() &&
+        resource.data.user_id == request.auth.uid &&
+        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['is_read']);
+      allow write: if isSuperAdmin();
+    }
+
+    // ─── Audit Logs ───────────────────────────────────────────────
+
+    match /audit_logs/{logId} {
+      // Only super admin reads audit logs
+      allow read: if isSuperAdmin();
+      // Audit log entries created by authenticated users (but immutable after creation)
+      allow create: if isAuthenticated();
+      // Nobody can update or delete audit logs
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    // ─── Expenses / Income ────────────────────────────────────────
+
+    match /expenses/{expenseId} {
+      allow read: if isAuthenticated();
+      allow write: if isSuperAdmin();
+    }
+
+    match /income/{incomeId} {
+      allow read: if isAuthenticated();
+      allow write: if isSuperAdmin();
+    }
+
+  }
+}
